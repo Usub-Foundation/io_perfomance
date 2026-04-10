@@ -1,8 +1,8 @@
 #include "common/args.h"
-#include "include/uvent/Uvent.h"
-#include "include/uvent/tasks/AwaitableFrame.h"
-#include "include/uvent/system/SystemContext.h"
-#include "include/uvent/net/Socket.h"
+#include "uvent/Uvent.h"
+#include "uvent/tasks/AwaitableFrame.h"
+#include "uvent/system/SystemContext.h"
+#include "uvent/net/Socket.h"
 
 using namespace usub::uvent;
 
@@ -33,17 +33,14 @@ task::Awaitable<void> clientCoro(net::TCPClientSocket s) {
 
 task::Awaitable<void> acceptLoop(std::string host, uint16_t port) {
     net::TCPServerSocket srv{host, int(port)};
-    for(;;){
-        auto cli = co_await srv.async_accept();
-        if (cli) system::co_spawn(clientCoro(std::move(*cli)));
-    }
+    for (;;) co_await srv.async_accept(clientCoro);
 }
 
 int main(int argc, char** argv){
     auto a = parse_args(argc, argv);
     usub::Uvent rt(a.threads);
-    for (int i=0;i<a.threads;i++)
-        system::co_spawn(acceptLoop(a.host, a.port));
+    rt.for_each_thread([&](int threadIndex, thread::ThreadLocalStorage* tls)
+		    { system::co_spawn_static(acceptLoop(a.host, a.port), threadIndex); });
     rt.run();
     return 0;
 }
