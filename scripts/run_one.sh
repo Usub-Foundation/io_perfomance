@@ -18,7 +18,7 @@ ts=$(date +"%Y%m%d_%H%M%S")
 LOG="logs/${name}_t${THREADS}_p${PORT}_${ts}.log"
 
 ARGS=(--host "$HOST" --port "$PORT")
-[[ "$name" != echo_libuv ]] && ARGS+=(--threads "$THREADS")
+ARGS+=(--threads "$THREADS")
 [[ "$REUSE" == "1" ]] && ARGS+=(--reuseport)
 
 setsid stdbuf -oL -eL "$BIN" "${ARGS[@]}" >"$LOG" 2>&1 &
