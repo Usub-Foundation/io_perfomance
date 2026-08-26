@@ -5,11 +5,12 @@ Reproducible throughput/latency comparison of async I/O libraries on the same mi
 
 Servers under test (`src/echo_tcp/`):
 
-| Binary       | Library                                                              | Threading model                                                                            |
-|--------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
-| `echo_uvent` | [uvent](https://github.com/Usub-Foundation/uvent) (C++23 coroutines) | N worker threads, one `TCPServerSocket` acceptor per thread (`SO_REUSEPORT`)               |
-| `echo_asio`  | Boost.Asio (callbacks)                                               | one `io_context`, N threads calling `run()`                                                |
-| `echo_libuv` | libuv 1.49 (C callbacks)                                             | N independent `uv_loop_t`, one per thread, each with its own listener (`UV_TCP_REUSEPORT`) |
+| Binary       | Library                                                                               | Threading model                                                                            |
+|--------------|---------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
+| `echo_uvent` | [uvent](https://github.com/Usub-Foundation/uvent) (C++23 coroutines), `epoll` backend | N worker threads, one `TCPServerSocket` acceptor per thread (`SO_REUSEPORT`)               |
+| `echo_uring` | same source built with `-DUVENT_ENABLE_IO_URING=ON`                                   | same                                                                                       |
+| `echo_asio`  | Boost.Asio (callbacks)                                                                | one `io_context`, N threads calling `run()`                                                |
+| `echo_libuv` | libuv 1.49 (C callbacks)                                                              | N independent `uv_loop_t`, one per thread, each with its own listener (`UV_TCP_REUSEPORT`) |
 
 Every server reads a request, answers a fixed 20-byte JSON body, keeps the connection open. No parsing, no allocation
 per
@@ -17,22 +18,37 @@ request — the numbers measure the event loop and syscall path, nothing else.
 
 ## Results
 
-| Threads | uvent RPS | Boost.Asio RPS | libuv RPS | uvent p99 | Boost.Asio p99 | libuv p99 | runs |
-|--------:|----------:|---------------:|----------:|----------:|---------------:|----------:|-----:|
-|       1 |   107,647 |        113,537 |   113,503 |   8.94 ms |        6.03 ms |   6.53 ms |    1 |
-|       2 |   209,711 |        209,883 |   210,899 |   4.83 ms |        4.41 ms |   4.77 ms |    1 |
-|       4 |   381,159 |        384,020 |   386,309 |   3.28 ms |        2.67 ms |   2.75 ms |    1 |
-|       8 |   541,207 |        498,647 |   588,272 |   2.01 ms |        2.36 ms |   2.68 ms |    3 |
+| Threads | uvent (epoll) RPS | uvent (io_uring) RPS | Boost.Asio RPS | libuv RPS | uvent (epoll) p99 | uvent (io_uring) p99 | Boost.Asio p99 | libuv p99 |
+|--------:|------------------:|---------------------:|---------------:|----------:|------------------:|---------------------:|---------------:|----------:|
+|       1 |           116,340 |              142,127 |        122,468 |   116,672 |          10.70 ms |              8.55 ms |        9.78 ms |  10.28 ms |
+|       2 |           222,968 |              288,274 |        218,789 |   232,583 |           5.07 ms |              4.03 ms |        5.63 ms |   5.10 ms |
+|       4 |           365,004 |              363,870 |        365,665 |   350,512 |           2.74 ms |              2.75 ms |        2.85 ms |   3.68 ms |
+|       8 |           512,845 |              528,681 |        481,241 |   554,192 |           2.07 ms |              2.01 ms |        2.58 ms |   2.38 ms |
 
 ![Mean RPS vs threads](images/rps_mean.png)
 
 Host: 1× Intel Xeon E5-2640 v4 (10 cores / 20 threads, 2.4 GHz), Linux 6.8, GCC 13.3, `-O3 -march=native` + LTO;
-uvent `f678513` (epoll backend), Boost 1.83, libuv 1.49.2. `wrk -t<threads> -c1000 -d30s --latency`, 3 s warm-up.
-Cells with `runs = 3` are the mean of three runs (spread < 4 %), the rest are single runs.
-Raw `wrk` output is in `results/` on the machine that ran it; the CSV behind the table is `images/summary_agg.csv`.
+uvent (both backends from the same source), Boost 1.83, libuv 1.49.2, liburing 2.15.
+`wrk -t4 -c1000 -d30s --latency` (`-t8` for the 8-thread row), 3 s warm-up, server and `wrk` on the same host; for the
+1/2/4-thread rows wrk is pinned to cores 5–9/15–19 (`WRK_CPUS`), away from the workers and their SMT siblings; the
+8-thread row cannot be separated on 10 cores and runs with wrk free-floating.
+Every cell is the **median of 3 runs on an idle host**; run-to-run spread was within ±3 % for every cell, and no
+run had a single `wrk` timeout. Treat differences under ~3 % as noise.
+The CSV behind the table is `images/summary_agg.csv`; raw `wrk` output stays in `results/` on the machine that ran it.
 
-Reading: up to 4 threads all three are within 2–5 % — the loop is not the bottleneck on this workload. At 8 threads
-libuv leads (~588k), uvent follows (~541k, lowest p99), Boost.Asio's single shared `io_context` trails (~499k).
+Reading the table:
+
+- **1–2 threads: uvent + io_uring is the fastest server here** (142k / 288k RPS) — 16–32 % over Boost.Asio and
+  22–24 % over libuv, 22–29 % over its own `epoll` build. The io_uring backend batches submissions and completions
+  and skips the speculative `recv()`/`epoll_wait` round trips the readiness-based loops pay per request.
+- **1–2 threads, `epoll` build:** level with libuv on one thread (116k vs 117k) and 5 % behind Asio; on two threads
+  it is ahead of Asio (223k vs 219k) and 4 % behind libuv. The kernel path is identical (one `recv`, one `send` per
+  request); the difference is a few hundred nanoseconds of user-space work per request — coroutine frames and the
+  scheduler round trip, the price of `co_await`, not of the loop.
+- **4 threads:** all four are within 4 % (351–366k); the loop stops mattering once four cores are busy.
+- **8 threads** (where `wrk` competes for the same 10 cores): uvent io_uring, uvent epoll and libuv sit at 513–554k;
+  Asio's single shared `io_context` falls behind (481k) with a visibly worse p99.
+
 Earlier versions of this repo showed libuv at a few hundred RPS. That was an artifact of the old single-loop
 `echo_libuv` and how it was run, not a property of libuv; the server has been rewritten (one loop per thread,
 `UV_TCP_REUSEPORT`) and every number above was re-measured with it.
@@ -46,6 +62,18 @@ cmake --build build -j
 
 uvent and libuv are fetched with `FetchContent`; Boost must be installed (`libboost-system-dev` or equivalent).
 
+io_uring variant (kernel 5.1+, [liburing](https://github.com/axboe/liburing)); built separately because the backend is a
+compile-time switch in uvent:
+
+```bash
+cmake -B build-uring -DCMAKE_BUILD_TYPE=Release -DWITH_UVENT=ON -DWITH_ASIO=OFF -DWITH_LIBUV=OFF -DENABLE_LTO=ON \
+      -DUVENT_ENABLE_IO_URING=ON   # + -DURING_LIB=/path/liburing.a -DCMAKE_CXX_FLAGS=-I/path/include if liburing is not system-wide
+cmake --build build-uring -j --target echo_uvent
+cp build-uring/echo_uvent build/echo_uring
+```
+
+To bench a custom set of binaries: `BINS="./build/echo_uvent ./build/echo_uring" scripts/run_all.sh`.
+
 ## Run
 
 ```bash
@@ -56,7 +84,9 @@ ulimit -n 65535                      # 1000 connections + wrk on the same host
 All libraries, full thread matrix (one `wrk` run per cell, results in `results/*.txt`, server logs in `logs/`):
 
 ```bash
-THREADS_LIST="1 2 4 8" CONN=1000 DUR=30s WARMUP=3s scripts/run_all.sh
+# what the table above was measured with (10c/20t host, SMT siblings are i and i+10):
+WRK_CPUS=5-9,15-19 THREADS_LIST="1 2 4" CONN=1000 DUR=30s WARMUP=3s scripts/run_all.sh   # wrk kept off the workers' cores
+                   THREADS_LIST="8"     CONN=1000 DUR=30s WARMUP=3s scripts/run_all.sh   # 8 workers + wrk can't be separated on 10 cores
 ```
 
 One library:
@@ -65,8 +95,11 @@ One library:
 THREADS=8 CONN=1000 DUR=30s scripts/run_one.sh ./build/echo_libuv
 ```
 
-`run_one.sh` starts the server, waits for the port, runs `wrk -t$THREADS -c$CONN -d$DUR --latency`, then stops the
-server. `--threads N` is passed to every binary, so all three scale on the same terms.
+`run_one.sh` starts the server, waits for the port, runs `wrk -t$WRK_THREADS -c$CONN -d$DUR --latency`, then stops the
+server. `--threads N` is passed to every binary, so all three scale on the same terms. `WRK_THREADS` defaults to
+`max(4, THREADS)`: with `-t1` wrk itself caps out around 110k RPS and would hide the difference between servers.
+`WRK_CPUS` (optional) runs wrk under `taskset -c`; keep it off the server's cores *and their SMT siblings* — a worker
+sharing a physical core with a wrk thread loses ~6 % RPS and its p99 doubles, and it shows up as run-to-run bimodality.
 
 For a quieter box see `scripts/sys_tune_example.sh` (somaxconn, syn backlog, `tcp_tw_reuse`).
 
@@ -82,9 +115,14 @@ python3 -m venv .venv && .venv/bin/pip install pandas matplotlib
 
 ## Caveats
 
-- `wrk` runs on the same host as the server, so at high thread counts the load generator competes for cores; keep
-  `THREADS × 2 ≤ physical cores` for clean numbers, or run `wrk` from a second machine.
+- `wrk` runs on the same host as the server. Keep it on its own physical cores (`WRK_CPUS`, mind SMT siblings) while
+  `server threads + wrk threads ≤ physical cores`; beyond that (the 8-thread row here) the load generator competes with
+  the servers and the numbers are "whole box" numbers. A second machine is the real fix.
 - This is a best-case, parse-free workload. It says nothing about HTTP parsing, TLS, or application logic — only about
   how
   cheaply each library moves bytes through `epoll`.
-- Single 30 s runs; expect a few percent of jitter. Repeat and average before drawing conclusions from small deltas.
+- Run-to-run jitter on a desktop with an IDE and browsers open is easily ±10 %; the table above is the median of
+  several runs per cell. Repeat and take medians before drawing conclusions from small deltas.
+- Server ports default to 28000+, *below* `ip_local_port_range`: with 1000 client connections per run wrk's ephemeral
+  ports will otherwise eventually land on the next server's port and the server dies with
+  `bind(): Address already in use`.

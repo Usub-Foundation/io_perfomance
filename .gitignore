@@ -5,3 +5,7 @@ build
 .idea
 results
 logs
+build-*
+results_*
+images/parsed_merged.csv
+.venv/
